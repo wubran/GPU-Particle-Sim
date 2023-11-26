@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html style="padding:0;margin:0;background-color:black">
+	<body id = "bodbod" style="padding:0;margin:0;overflow:hidden;">
+		<script 
+			src="https://unpkg.com/gpu.js@latest/dist/gpu-browser.min.js">
+		</script>
+		<script 
+			rc="https://cdn.jsdelivr.net/npm/gpu.js@latest/dist/gpu-browser.min.js">
+		</script>
+		<script>
+			const gpu = new GPU.GPU();
+			
+			// particle GPU pipeline:
+			// number of particles --> initial list of positions
+			// number of particles --> permanent list of *masses
+			// particle location/mass info --> particle forces --> particle summed accelerations
+			// particle accelerations + particle velocities --> *new particle velocities --> *new particle locations
+			// new particle locations --> draw circles and potential map
+
+			var pause = false;
+			var click = false;
+			var mouseX = 0;
+			var mouseY = 0;
+
+			var numParticles = 511;
+
+			// input [1] number of particles
+			// output [particlesX2] list of location coordinates
+			const generatePlaces = gpu.createKernel(function() {
+				return [Math.random()*this.constants.cW, Math.random()*this.constants.cH]; // R2 Vector
+			}).setOutput([numParticles]).setPipeline(true).setConstants({
+				cW: window.innerWidth,
+				cH: window.innerHeight
+			});
+
+			// input [1] number of particles
+			// output [particles] list of masses
+			const generateMasses = gpu.createKernel(function(numParticles) {
+				// return 0.2+1.2*Math.random(); // Number
+				return 0.1;
+			}).setOutput([numParticles]).setPipeline(true).setImmutable(true);
+
+			// input [1] number of particles
+			// output [particlesX2] list of velos
+			const generateVelos = gpu.createKernel(function(numParticles) {
+				return [Math.random()*8-4, Math.random()*8-4]; // R2 Vector
+			}).setOutput([numParticles]).setPipeline(true);
+
+			// input [particlesX2] list of location coordinates and [particles] list of masses
+			// output [particlesXparticlesX2] array of force vectors
+			const locationsMassesToForce = gpu.createKernel(function(places, masses) {
+				if(this.thread.x>this.thread.y){
+					// calculate force between planet x and planet y
+					let myPlace = places[this.thread.x];
+					let otherPlace = places[this.thread.y];
+					// ghere += maspos[j][2]/((floatThreadX-maspos[j][0])*(floatThreadX-maspos[j][0]) + (floatThreadY-maspos[j][1])*(floatThreadY-maspos[j][1]));
+					let dx = otherPlace[0]-myPlace[0];
+					let dy = otherPlace[1]-myPlace[1];
+					// let denom = (dx + dy)*(dx + dy);
+					// gxhere += maspos[j][2]*2*(floatThreadX-maspos[j][0])/denom;
+					// gyhere += maspos[j][2]*2*(floatThreadY-maspos[j][1])/denom;
+					let denom = 0.02*masses[this.thread.x]*masses[this.thread.y]/((dx*dx+dy*dy)**1.5); // SO slow
+					return [denom*(otherPlace[0]-myPlace[0]), denom*(otherPlace[1]-myPlace[1])];
+				}
+				return [0.0,0.0]; // R2 Vector
+			}).setOutput([numParticles,numParticles]).setPipeline(true).setDynamicOutput(true);
+
+			const DISTMAX = 120;
+			const eqdist = 69;
+			const ATTRACT = 0.1;
+			const boidForce = gpu.createKernel(function(places, masses) {
+				if(this.thread.x>this.thread.y){
+					const myPlace = places[this.thread.x];
+					const otherPlace = places[this.thread.y];
+
+					const diffx = otherPlace[0]-myPlace[0];
+					const diffy = otherPlace[1]-myPlace[1];
+					// const absdx = Math.abs(diffx);
+					// const absdy = Math.abs(diffy);
+					// if(absdx>this.constants.DISTMAX || absdy>this.constants.DISTMAX || absdx+absdy>this.constants.SQRTDISTMAX){
+					// 	return [0.0,0.0]; // R2 Vector
+					// }
+					const dist1 = diffx*diffx+diffy*diffy;
+
+					if(dist1>this.constants.DISTMAXSQRED){
+						return [0.0,0.0]; // R2 Vector
+					}
+
+					const fakeDist = 1/dist1;
+					
+					const multiplier = masses[this.thread.x]*masses[this.thread.y]*(this.constants.ratio*fakeDist-1)*this.constants.ATTRACT*Math.sqrt(fakeDist);
+
+					return [diffx*multiplier, diffy*multiplier];
+				}
+				return [0.0,0.0]; // R2 Vector
+			}).setOutput([numParticles,numParticles]).setPipeline(true).setDynamicOutput(true).setConstants({
+				DISTMAX:DISTMAX,
+				SQRTDISTMAX:Math.sqrt(2)*DISTMAX,
+				DISTMAXSQRED:DISTMAX*DISTMAX,
+				eqdist:eqdist,
+				ratio:eqdist*eqdist,
+				ATTRACT:ATTRACT
+			});
+
+			// input [particlesXparticlesX2] array of force vectors and and [particles] list of masses
+			// output [particlesX2] list of summed up acceleration vectors
+			const forceArrayToAccel = gpu.createKernel(function(forceArray, masses) {
+				var sumX = 0;
+				var sumY = 0;
+				
+				// one column of forceArray corresponding to a particle being accelerated
+				// let currentSlot = forceArray[this.thread.x];
+				const chunk = this.thread.x*this.constants.numParticles;
+				const bound = this.constants.numParticles-this.thread.x;
+				for(let i = 1; i < bound; i++){ // gets an incomplete sum
+					const currIndex = chunk+i;
+					const currThing = forceArray[currIndex]
+					sumX += currThing[0];
+					sumY += currThing[1];
+				}
+				const bound2 = this.constants.numParticles*this.thread.x;
+				for(let i = this.thread.x; i < bound2; i+=this.constants.numParticles){ // gets an incomplete sum
+					const currThing = forceArray[i]
+					sumX -= currThing[0];
+					sumY -= currThing[1];
+				}
+				// return [sumX/masses[i],sumY/masses[i]]; // R2 Vector
+				const myMass = masses[this.thread.x];
+				sumX /= myMass;
+				sumY /= myMass;
+				if(-this.constants.maxcell>sumX){
+					sumX = -this.constants.maxcell;
+				} else if(sumX>this.constants.maxcell){
+					sumX = this.constants.maxcell;
+				}
+				if(-this.constants.maxcell>sumY){
+					sumY = -this.constants.maxcell;
+				} else if(sumY>this.constants.maxcell){
+					sumY = this.constants.maxcell;
+				}
+
+				return [sumX,sumY]
+				// return [0,0];
+			}).setOutput([numParticles]).setPipeline(true).setDynamicOutput(true).setConstants({
+				numParticles: numParticles,
+				maxcell:4
+			});
+
+			// input [particlesX2] list of acceleration vectors and [particlesX2] list of velocity vectors
+			// output [particlesX2] list of updated velocity vectors
+			const accelVeloToVelo = gpu.createKernel(function(accels, velos, places) {
+				let bruh = velos[this.thread.x];
+				let gruh = accels[this.thread.x];
+				let fruh = places[this.thread.x];
+
+				const borderslope = this.constants.borderWidth/this.constants.borderstrength;
+
+				if(fruh[0] > this.constants.cW - this.constants.borderWidth){
+					gruh[0] += 0.04*((fruh[0]-this.constants.cW)/borderslope-this.constants.borderstrength);
+				} else if(fruh[0] < this.constants.borderWidth){
+					gruh[0] += 0.04*(fruh[0]/borderslope+this.constants.borderstrength);
+				}
+
+				if(fruh[1] > this.constants.cH - this.constants.borderWidth){
+					gruh[1] += 0.04*((fruh[1]-this.constants.cH)/borderslope-this.constants.borderstrength);
+				} else if(fruh[1] < this.constants.borderWidth){
+					gruh[1] += 0.04*(fruh[1]/borderslope+this.constants.borderstrength);
+				}
+				
+				return [(bruh[0] + gruh[0])*this.constants.friction, (bruh[1] + gruh[1])*this.constants.friction]; // R2 Vector
+			}).setOutput([numParticles]).setPipeline(true).setImmutable(true).setDynamicOutput(true).setConstants({
+				friction: 0.97,
+				cH:window.innerHeight,
+				cW:window.innerWidth,
+				borderWidth:100,
+				borderstrength:10
+			});
+
+			// input [particlesX2] list of velocity vectors and [particlesX2] list of location coordinates
+			// output [particlesX2] list of updated location coordinates
+			const veloPosToPos = gpu.createKernel(function(velos, places) {
+				let bruh = places[this.thread.x];
+				let gruh = velos[this.thread.x];
+
+				return [bruh[0] + gruh[0], bruh[1] + gruh[1]]; // R2 Vector
+			}).setOutput([numParticles]).setPipeline(true).setImmutable(true).setDynamicOutput(true)
+
+			const posVeloAccel = gpu.createKernelMap({
+				addResult: function add(pos, step) {
+					return pos + step*this.constants.tStep;
+				},
+			}, function(pos, velo, accel) {
+				return add(pos, add(accel, velo));
+			}, { output: [numParticles] }).setConstants({
+				tStep: 1,
+			});
+			
+
+			// input [particlesX2] list of location coordinates and [particles] list of masses,
+			// output planet circles and topological map to canvas
+			const canvasKernel = gpu.createKernel(function(places, masses){
+				let gxhere = 0;
+				let gyhere = 0;
+				let floatThreadX = this.thread.x + 0.0;
+				let floatThreadY = this.thread.y + 0.0;
+				for(let j = 0; j<this.constants.numParticles; j++){ // 12 is number of planets
+					let mePlace = places[j];
+					// ghere += maspos[j][2]/((floatThreadX-maspos[j][0])*(floatThreadX-maspos[j][0]) + (floatThreadY-maspos[j][1])*(floatThreadY-maspos[j][1]));
+					let dx = floatThreadX-mePlace[0];
+					let dy = floatThreadY-mePlace[1];
+					// let denom = (dx + dy)*(dx + dy);
+					// gxhere += maspos[j][2]*2*(floatThreadX-maspos[j][0])/denom;
+					// gyhere += maspos[j][2]*2*(floatThreadY-maspos[j][1])/denom;
+					let denom = 0.02*masses[j]/((dx*dx+dy*dy)**1.5); // SO slow
+					gxhere += denom*(floatThreadX-mePlace[0]);
+					gyhere += denom*(floatThreadY-mePlace[1]);
+				}
+				//ghere = ghere*100000
+				let ghere = 20000000*(Math.sqrt(gxhere*gxhere + gyhere*gyhere));
+				let broke = false;
+				let search = 1/9;
+				let i = 4*(floatThreadX + floatThreadY*this.constants.cW);
+				for(let j = 0; j < 10; j++){ // 11 is lines.length
+					if((ghere < search*2.90 && ghere > search*1.1) || ghere > 6561*1.02 || ghere < 0.98){
+						broke = true;
+					}
+					search*=3;
+				}
+				if(broke){
+					this.color(0, 0, 0, 0);
+				} else{
+					let theta = 0;
+					if(gyhere >= 0){
+						theta = Math.atan(-gxhere/gyhere)+Math.PI; // 90 to 270
+					} else {
+						theta = Math.atan(-gxhere/gyhere); // -90 to 90
+						if(theta < 0){
+							theta += 2*Math.PI; // 0-90, 270-360
+						}
+					}
+
+					// let color = 4000/ghere;
+					// this.color((255-color)/255, (255-Math.abs(color-170))/255, color/255, 1);
+					let strength = 1/(1+Math.exp(-ghere/20+1.5));
+					this.color(1/3+strength*(1/3+Math.sin(theta)/3), 1/3+strength*(1/3+Math.sin(theta + 2*Math.PI/3)/3), 1/3+strength*(1/3+Math.sin(theta + 4*Math.PI/3)/3), 1);
+					// this.color(1/2+strength*(1/4+Math.sin(theta)/4), strength*(1/3+Math.sin(theta)/3), 1/3+strength*(1/3+Math.sin(theta + Math.PI)/3), 1);
+
+				}
+			}).setOutput([window.innerWidth,window.innerHeight]).setGraphical(true).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				// cH: window.innerHeight
+			});
+
+			const pixelKernel = gpu.createKernel(function(places, masses){
+				let floatThreadX = this.thread.x + 0.0;
+				let floatThreadY = this.thread.y + 0.0;
+
+				let mePlace = places[this.thread.z];
+				// ghere += maspos[j][2]/((floatThreadX-maspos[j][0])*(floatThreadX-maspos[j][0]) + (floatThreadY-maspos[j][1])*(floatThreadY-maspos[j][1]));
+				let dx = floatThreadX-mePlace[0];
+				let dy = floatThreadY-mePlace[1];
+				// let denom = (dx + dy)*(dx + dy);
+				// gxhere += maspos[j][2]*2*(floatThreadX-maspos[j][0])/denom;
+				// gyhere += maspos[j][2]*2*(floatThreadY-maspos[j][1])/denom;
+				let denom = 0.02*masses[this.thread.z]/((dx*dx+dy*dy)**1.5); // SO slow
+				let gxhere = denom*(floatThreadX-mePlace[0]);
+				let gyhere = denom*(floatThreadY-mePlace[1]);
+				
+				return [gxhere, gyhere];
+			}).setOutput([window.innerWidth,window.innerHeight,numParticles]).setPipeline(true).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				// cH: window.innerHeight
+			});
+
+			const testPixelKernel = gpu.createKernel(function(places, masses){
+				return 1;//[gxhere, gyhere];
+			}).setOutput([window.innerWidth,window.innerHeight,numParticles]).setPipeline(true).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				// cH: window.innerHeight
+			});
+
+			const canvas3dKernel = gpu.createKernel(function(pixelVectors){
+				var sumX = 0;
+				var sumY = 0;
+				
+				// assume that thread.x represents the pixel X we are on
+				// const OUT = this.thread.x*this.constants.cH*this.constants.cW;
+				
+				// assume that thread.y represents the pixel Y we are on
+				// const IN = this.thread.y*this.constants.numParticles;
+				for(let i = 0; i < this.constants.numParticles; i++){
+					// iterate through all the particles that are influencing this pixel
+					const CURRINDEX = i*this.constants.cH*this.constants.cW + this.thread.y*this.constants.cW + this.thread.x;
+					const CURRVECT = pixelVectors[CURRINDEX];
+					sumX += CURRVECT[0];
+					sumY += CURRVECT[1];
+				}
+
+				// const gxhere = sumX;
+				// const gyhere = sumY;
+				// this.color(Math.atan(100000*gxhere)/Math.PI+.5, Math.atan(100000*gyhere)/Math.PI+0.5, -Math.atan(100000*gxhere)/Math.PI/2-Math.atan(100000*gyhere)/Math.PI/2+.5, 0)
+				sumX*=100000;
+				sumY*=100000;
+				const color1 = 0.5*sumX/(Math.abs(sumX)+1) + 0.5;
+				const color2 = 0.5*sumY/(Math.abs(sumY)+1) + 0.5;
+				this.color(color1, color2, (2-color1-color2)/2, 0);
+				// this.color(1,1,0,1);
+
+			}).setOutput([window.innerWidth, window.innerHeight]).setGraphical(true).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				cH: window.innerHeight
+			});
+
+			const outputTest = gpu.createKernel(function(pixelVectors){
+				var sumX = 0;
+				var sumY = 0;
+				
+				// assume that thread.x represents the pixel X we are on
+				// const OUT = this.thread.x*this.constants.cH*this.constants.cW;
+				
+				// assume that thread.y represents the pixel Y we are on
+				// const IN = this.thread.y*this.constants.numParticles;
+
+				for(let i = 0; i < this.constants.numParticles; i++){
+					// iterate through all the particles that are influencing this pixel
+					const CURRINDEX = i*this.constants.cH*this.constants.cW + this.thread.y*this.constants.cW + this.thread.x;
+					const CURRVECT = pixelVectors[CURRINDEX]
+					sumX += CURRVECT[0];
+					sumY += CURRVECT[1];
+				}
+
+				return([sumX, sumY]);
+			}).setOutput([window.innerWidth, window.innerHeight]).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				cH: window.innerHeight
+			});
+			
+			const graphicsTest = gpu.createKernel(function(){
+				let floatThreadX = this.thread.x + 0.0;
+				let floatThreadY = this.thread.y + 0.0;
+				// this.color(floatThreadX/this.constants.cW, floatThreadY/this.constants.cW, 0);
+				this.color(1, 1, 1, 1);
+			}).setOutput([window.innerWidth,window.innerHeight]).setGraphical(true).setConstants({
+				cW: window.innerWidth,
+				cH: window.innerHeight
+			});
+
+			const canvasDotsKernel = gpu.createKernel(function(places, masses){
+				let gxhere = 0;
+				let gyhere = 0;
+				let floatThreadX = this.thread.x + 0.0;
+				let floatThreadY = this.thread.y + 0.0;
+				let brokent = true;
+				for(let j = 0; j<this.constants.numParticles; j++){ // 12 is number of planets
+					const mePlace = places[j];
+					// ghere += maspos[j][2]/((floatThreadX-maspos[j][0])*(floatThreadX-maspos[j][0]) + (floatThreadY-maspos[j][1])*(floatThreadY-maspos[j][1]));
+					const dx = floatThreadX-mePlace[0];
+					const dy = floatThreadY-mePlace[1];
+					const sqrDist = dx*dx+dy*dy;
+					const massCompare = 50*masses[j]; // unit is in area
+
+					if(sqrDist < 2*massCompare && sqrDist > massCompare){
+						this.color(1, 1, 1, 1);
+						brokent = false;
+						break;
+						// return;
+					}
+					// let denom = (dx + dy)*(dx + dy);
+					// gxhere += maspos[j][2]*2*(floatThreadX-maspos[j][0])/denom;
+					// gyhere += maspos[j][2]*2*(floatThreadY-maspos[j][1])/denom;
+					const denom = 0.02*masses[j]/((sqrDist)**1.5); // SO slow
+					gxhere += denom*(floatThreadX-mePlace[0]);
+					gyhere += denom*(floatThreadY-mePlace[1]);
+				}
+				if(brokent){
+					// this.color(Math.atan(100000*gxhere)/Math.PI+.5, Math.atan(100000*gyhere)/Math.PI+0.5, -Math.atan(100000*gxhere)/Math.PI/2-Math.atan(100000*gyhere)/Math.PI/2+.5, 0)
+					// this.color(1/3+strength*(1/3+Math.sin(theta)/3), 1/3+strength*(1/3+Math.sin(theta + 2*Math.PI/3)/3), 1/3+strength*(1/3+Math.sin(theta + 4*Math.PI/3)/3), 1);
+					// this.color(1/2+strength*(1/4+Math.sin(theta)/4), strength*(1/3+Math.sin(theta)/3), 1/3+strength*(1/3+Math.sin(theta + Math.PI)/3), 1);
+					gxhere*=100000;
+					gyhere*=100000;
+					const color1 = 0.5*gxhere/(Math.abs(gxhere)+1) + 0.5;
+					const color2 = 0.5*gyhere/(Math.abs(gyhere)+1) + 0.5;
+					this.color(color1, color2, (2-color1-color2)/2, 0);
+				}	
+			}).setOutput([window.innerWidth,window.innerHeight]).setGraphical(true).setConstants({
+				numParticles: numParticles,
+				cW: window.innerWidth,
+				// cH: window.innerHeight
+			});
+
+			const kCanvas = canvas3dKernel.canvas//canvasKernel.canvas;
+			// console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+			kCanvas.width = window.innerWidth;
+			kCanvas.height = window.innerHeight;
+			// console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+			document.getElementsByTagName('body')[0].appendChild(kCanvas);
+			// console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+
+            var places = generatePlaces();
+			// console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+			const masses = generateMasses(numParticles);
+			var velos = generateVelos(numParticles);
+			// console.log(generateVelos.toString(numParticles));
+			// console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+			var forceArray;
+			var accels;
+			var pixelVectors;
+			// this should loop
+			var testBool = true;
+			var startTime = Date.now();
+			var tList = [];
+			function loopy(timestamp){
+				console.log(tList);
+				tList = [];
+				// forceArray = locationsMassesToForce(places, masses);
+				if(pause){
+					return;
+				}
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				forceArray = boidForce(places, masses);
+				tList.push(Date.now()-startTime);
+
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				accels = forceArrayToAccel(forceArray, masses);
+				tList.push(Date.now()-startTime);
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				velos = accelVeloToVelo(accels, velos.clone(), places);
+				tList.push(Date.now()-startTime);
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				places = veloPosToPos(velos, places.clone());
+				tList.push(Date.now()-startTime);
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				velos.delete(); // why does this work???
+				places.delete(); // ????????
+				tList.push(Date.now()-startTime);
+				canvasDotsKernel(places, masses);
+
+				// canvasKernel(places, masses);
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// }
+				// pixelVectors = testPixelKernel(places, masses);
+
+				// 3D VERSION STARTS HERE
+				// pixelVectors = pixelKernel(places, masses);
+				// tList.push(Date.now()-startTime);
+				// kCanvas.height = window.innerHeight;
+				// kCanvas.width = window.innerWidth;
+				// canvas3dKernel(pixelVectors);
+				// 3D VERSION ENDS HERE
+
+				// if(testBool){
+				// 	console.log("canvasThings: ", kCanvas.width, kCanvas.height);
+				// 	testBool = false;
+				// 	// console.log(pixelVectors.toArray().slice(0,2));
+				// 	// console.log(outputTest(pixelVectors));
+				// }
+				tList.push(Date.now()-startTime);
+				// graphicsTest();
+				startTime = Date.now();
+
+				requestAnimationFrame(loopy);
+			}
+			loopy();
+			// places.delete();
+			// console.log(forceArray.toArray());
+			// console.log(accels.toArray());
+			// setInterval(loopy,50);
+			requestAnimationFrame(loopy);
+
+			// console.log("masses: ", masses.toArray())
+
+			// const accelDiagnose = gpu.createKernel(function(forceArray, masses) {
+			// 	var sumX = 0;
+			// 	var sumY = 0;
+			// 	// one column of forceArray corresponding to a particle being accelerated
+			// 	// five float32arrays of length 2
+			// 	let currentSlot = forceArray[24];
+			// 	// returns a float32array of length 2
+			// 	return currentSlot;
+			// 	// return [sumX/masses[this.thread.x],sumY/masses[this.thread.x]]; // R2 Vector
+			// 	// return [0,0];
+			// }).setOutput([1]).setPipeline(true).setDynamicOutput(true).setConstants({
+			// 	numParticles: 5,
+			// });
+
+			// console.log(forceArray.toArray());
+			// console.log(accelDiagnose(forceArray, masses).toArray());
+
+		</script>
+		<script type="text/javascript" src="events.js"></script>
+	</body>
+</html>
